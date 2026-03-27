@@ -1,0 +1,13 @@
+# 1. 忽略所有内容
+*
+
+# 2. 允许追踪 .gitignore 自己
+!.gitignore
+
+# 3. 允许追踪根目录下的脚本
+!run_sft.sh
+
+# 4. 允许进入 dataset 文件夹并追踪目标文件
+!dataset/
+dataset/*
+!dataset/fast_prepare.py
