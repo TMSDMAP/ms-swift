@@ -11,3 +11,6 @@
 !dataset/
 dataset/*
 !dataset/fast_prepare.py
+!patent/
+patent/*
+!patent/convert_dta_to_json.py
