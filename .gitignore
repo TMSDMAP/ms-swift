@@ -15,4 +15,5 @@ dataset/*
 patent/*
 !patent/convert_dta_to_json.py
 !patent/csv_to_json_fallback.py
+!patent/build_patent_sqlite.py
 !patent/dta_to_json_guardian.py
