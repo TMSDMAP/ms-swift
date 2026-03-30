@@ -15,7 +15,7 @@ swift sft \
     --dataset /home/ljh/data1/dataset/train.jsonl \
     --val_dataset /home/ljh/data1/dataset/val.jsonl \
     --attn_impl flash_attn \
-    --torch_dtype bfloat16 \
+    --dtype bfloat16 \
     --eval_strategy steps \
     --output_dir output/Qwen3_10W \
     --save_steps 100 \
@@ -23,7 +23,6 @@ swift sft \
     --save_total_limit 5 \
     --logging_steps 10 \
     --num_train_epochs 1 \
-    --query_max_length 512 \
     --max_length 2048 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 16 \
