@@ -205,9 +205,9 @@ def build_sample_from_record(
     view_a_content = f"标题：{record.title}\n摘要：{record.abstract}"
     
     p = rng.random()
-    if p < 0.30:
+    if p < 0.05:
         view_b_content = view_a_content
-    elif p < 0.65:
+    elif p < 0.50:
         view_b_content = f"权利要求：{record.claims}"
     else:
         view_b_content = f"背景技术：{record.background}"
@@ -233,14 +233,23 @@ def build_sample_from_record(
     except Exception:
         raw_matches = []
         
+    hard_neg_pool = []
     candidate_pool = []
-    for match in raw_matches[10:]:
+    # 跳过本体（第0个），提取前15名作为 Hard Negative 强干扰池，后面的作为按 IPC 落位的普通候选
+    for i, match in enumerate(raw_matches[1:]):
         try:
             if isinstance(match, dict) and "id" in match:
                 idx = int(match["id"])
             else:
                 idx = int(match)
-            candidate_pool.append(idx)
+                
+            if idx < 0 or idx >= len(doc_ids) or doc_ids[idx] == record.patent_id:
+                continue
+                
+            if i < 15:
+                hard_neg_pool.append(idx)
+            else:
+                candidate_pool.append(idx)
         except (ValueError, TypeError):
             continue
 
@@ -254,11 +263,6 @@ def build_sample_from_record(
     pool_any = []
 
     for idx in candidate_pool:
-        if idx < 0 or idx >= len(doc_ids):
-            continue
-        if doc_ids[idx] == current_id:
-            continue
-
         c_subclass, c_maingroup, c_subgroup = extract_ipc_levels(doc_ipc[idx])
         if c_subgroup == t_subgroup:
             pool_l1.append(idx)
@@ -271,6 +275,14 @@ def build_sample_from_record(
 
     target_neg_count = 4
     chosen = []
+    
+    # 策略核心：必定混入 1~2 个顶级的 Hard Negative 以彻底拉高收敛难度
+    if hard_neg_pool:
+        num_hard = rng.choice([1, 2])
+        num_hard = min(num_hard, len(hard_neg_pool))
+        chosen.extend(rng.sample(hard_neg_pool, k=num_hard))
+
+    # 剩余数量从阶梯池子里补充
     for pool in [pool_l1, pool_l2, pool_l3, pool_any]:
         if len(chosen) >= target_neg_count:
             break
