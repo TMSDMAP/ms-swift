@@ -151,7 +151,9 @@ class QueryFinal:
     positive_from_self: int
     positive_from_other: int
     bm25_hard_neg_pubnos: List[str]
+    ipc_semantic_neg_pubnos: List[str]
     ipc_random_neg_pubnos: List[str]
+    cross_ipc_hard_neg_pubnos: List[str]
 
     def as_input_text(self) -> str:
         return make_input_text(self.title, self.abstract, self.first_claim)
@@ -418,9 +420,10 @@ def scan_window_collect(
     target_ipc_set: Set[str],
     excluded_pubnos: Set[str],
     bm25_pool_per_ipc: int,
+    global_bm25_pool_size: int,
     rng: random.Random,
     sql_fetch_batch: int,
-) -> Tuple[Dict[str, PatentText], Dict[str, List[PatentText]]]:
+) -> Tuple[Dict[str, PatentText], Dict[str, List[PatentText]], List[PatentText]]:
     sql = (
         f'SELECT "公开公告号", "标题", "摘要", "首项权利要求", "第一申请人", "申请日", "IPC主分类" '
         f'FROM "{table}" '
@@ -431,6 +434,8 @@ def scan_window_collect(
     positive_map: Dict[str, PatentText] = {}
     ipc_reservoir: Dict[str, List[PatentText]] = {ipc: [] for ipc in target_ipc_set}
     ipc_seen_count: Dict[str, int] = {ipc: 0 for ipc in target_ipc_set}
+    global_reservoir: List[PatentText] = []
+    global_seen = 0
 
     scanned = 0
     cur = conn.execute(sql, (str(start_year), str(end_year)))
@@ -455,14 +460,18 @@ def scan_window_collect(
                 seen = reservoir_add(ipc_reservoir[ipc], rec, seen, bm25_pool_per_ipc, rng)
                 ipc_seen_count[ipc] = seen
 
+            if global_bm25_pool_size > 0:
+                global_seen = reservoir_add(global_reservoir, rec, global_seen, global_bm25_pool_size, rng)
+
             if scanned % 500000 == 0:
                 found = len(positive_map)
                 log(f"[window scan] scanned={scanned}, positive_found={found}")
 
     log(
-        f"Window scan done: scanned={scanned}, positive_found={len(positive_map)}, ipc_pools={len(ipc_reservoir)}"
+        f"Window scan done: scanned={scanned}, positive_found={len(positive_map)}, "
+        f"ipc_pools={len(ipc_reservoir)}, global_pool={len(global_reservoir)}"
     )
-    return positive_map, ipc_reservoir
+    return positive_map, ipc_reservoir, global_reservoir
 
 
 def bm25_rank_indices(bm25, query_tokens: List[str], top_k: int) -> List[int]:
@@ -485,14 +494,29 @@ def bm25_rank_indices(bm25, query_tokens: List[str], top_k: int) -> List[int]:
     return out
 
 
+def unique_docs_by_pubno(docs: Sequence[PatentText]) -> List[PatentText]:
+    out: List[PatentText] = []
+    seen: Set[str] = set()
+    for d in docs:
+        if not d.pubno or d.pubno in seen:
+            continue
+        seen.add(d.pubno)
+        out.append(d)
+    return out
+
+
 def build_final_queries(
     query_raw_pool: Sequence[QueryRaw],
     positive_map: Dict[str, PatentText],
     ipc_reservoir: Dict[str, List[PatentText]],
+    global_docs: Sequence[PatentText],
     query_size: int,
     hard_neg_per_query: int,
+    ipc_semantic_per_query: int,
     ipc_random_per_query: int,
+    cross_ipc_hard_per_query: int,
     bm25_top_k: int,
+    cross_ipc_bm25_top_k: int,
     rng: random.Random,
 ) -> List[QueryFinal]:
     # Build BM25 index for each IPC pool once.
@@ -509,6 +533,25 @@ def build_final_queries(
             "bm25": bm25,
             "tokens": tokenized,
         }
+
+    global_bm25_state: Optional[Dict[str, object]] = None
+    if cross_ipc_hard_per_query > 0:
+        global_docs_u = unique_docs_by_pubno(global_docs)
+        if not global_docs_u:
+            raise RuntimeError(
+                "cross_ipc_hard_per_query > 0 but global_docs is empty; "
+                "increase global_bm25_pool_size"
+            )
+        global_corpus = [d.as_input_text() for d in global_docs_u]
+        global_tokens = [tokenize_for_bm25(x) for x in global_corpus]
+        global_bm25 = bm25s.BM25()
+        global_bm25.index(global_tokens)
+        global_bm25_state = {
+            "docs": global_docs_u,
+            "bm25": global_bm25,
+            "tokens": global_tokens,
+        }
+        log(f"Global BM25 ready for cross-IPC negatives: docs={len(global_docs_u)}")
 
     final: List[QueryFinal] = []
 
@@ -575,14 +618,98 @@ def build_final_queries(
         if len(hard_pub) < hard_neg_per_query:
             continue
 
+        semantic_pub: List[str] = []
+        semantic_seen: Set[str] = set()
+        if ipc_semantic_per_query > 0:
+            for idx in ranked_idx:
+                if idx < 0 or idx >= len(docs):
+                    continue
+                p = docs[idx].pubno
+                if (not p) or (p in forbid) or (p in hard_seen) or (p in semantic_seen):
+                    continue
+                semantic_seen.add(p)
+                semantic_pub.append(p)
+                if len(semantic_pub) >= ipc_semantic_per_query:
+                    break
+
+            if len(semantic_pub) < ipc_semantic_per_query:
+                semantic_pool = [
+                    d.pubno
+                    for d in docs
+                    if d.pubno and d.pubno not in forbid and d.pubno not in hard_seen and d.pubno not in semantic_seen
+                ]
+                need = ipc_semantic_per_query - len(semantic_pub)
+                extra = pick_random(rng, semantic_pool, min(need, len(semantic_pool)))
+                semantic_pub.extend(extra)
+                semantic_seen.update(extra)
+
+            if len(semantic_pub) < ipc_semantic_per_query:
+                continue
+
         rand_pool = [
             d.pubno
             for d in docs
-            if d.pubno and d.pubno not in forbid and d.pubno not in hard_seen
+            if d.pubno and d.pubno not in forbid and d.pubno not in hard_seen and d.pubno not in semantic_seen
         ]
         rand_pub = pick_random(rng, rand_pool, ipc_random_per_query)
         if len(rand_pub) < ipc_random_per_query:
             continue
+        rand_seen = set(rand_pub)
+
+        cross_pub: List[str] = []
+        cross_seen: Set[str] = set()
+        if cross_ipc_hard_per_query > 0:
+            if global_bm25_state is None:
+                raise RuntimeError("global_bm25_state is None while cross_ipc_hard_per_query > 0")
+
+            global_docs_u: List[PatentText] = global_bm25_state["docs"]  # type: ignore[assignment]
+            global_bm25 = global_bm25_state["bm25"]
+            ranked_global_idx = bm25_rank_indices(
+                global_bm25,
+                q_tokens,
+                max(cross_ipc_hard_per_query * 24, cross_ipc_bm25_top_k),
+            )
+
+            for idx in ranked_global_idx:
+                if idx < 0 or idx >= len(global_docs_u):
+                    continue
+                rec = global_docs_u[idx]
+                p = rec.pubno
+                if (
+                    (not p)
+                    or (p in forbid)
+                    or (p in hard_seen)
+                    or (p in semantic_seen)
+                    or (p in rand_seen)
+                    or (p in cross_seen)
+                ):
+                    continue
+                if rec.ipc4 == q.query_ipc4:
+                    continue
+                cross_seen.add(p)
+                cross_pub.append(p)
+                if len(cross_pub) >= cross_ipc_hard_per_query:
+                    break
+
+            if len(cross_pub) < cross_ipc_hard_per_query:
+                cross_pool = [
+                    d.pubno
+                    for d in global_docs_u
+                    if d.pubno
+                    and d.ipc4 != q.query_ipc4
+                    and d.pubno not in forbid
+                    and d.pubno not in hard_seen
+                    and d.pubno not in semantic_seen
+                    and d.pubno not in rand_seen
+                    and d.pubno not in cross_seen
+                ]
+                need = cross_ipc_hard_per_query - len(cross_pub)
+                extra = pick_random(rng, cross_pool, min(need, len(cross_pool)))
+                cross_pub.extend(extra)
+                cross_seen.update(extra)
+
+            if len(cross_pub) < cross_ipc_hard_per_query:
+                continue
 
         qf = QueryFinal(
             query_pubno=q.query_pubno,
@@ -595,7 +722,9 @@ def build_final_queries(
             positive_from_self=pos_self,
             positive_from_other=pos_other,
             bm25_hard_neg_pubnos=hard_pub,
+            ipc_semantic_neg_pubnos=semantic_pub,
             ipc_random_neg_pubnos=rand_pub,
+            cross_ipc_hard_neg_pubnos=cross_pub,
         )
         final.append(qf)
 
@@ -612,12 +741,15 @@ def build_global_candidate_map(
     final_queries: Sequence[QueryFinal],
     positive_map: Dict[str, PatentText],
     ipc_reservoir: Dict[str, List[PatentText]],
+    global_docs: Sequence[PatentText],
 ) -> Dict[str, PatentText]:
     need: Set[str] = set()
     for q in final_queries:
         need.update(q.positive_pubnos)
         need.update(q.bm25_hard_neg_pubnos)
+        need.update(q.ipc_semantic_neg_pubnos)
         need.update(q.ipc_random_neg_pubnos)
+        need.update(q.cross_ipc_hard_neg_pubnos)
 
     out: Dict[str, PatentText] = {}
 
@@ -629,6 +761,10 @@ def build_global_candidate_map(
         for rec in docs:
             if rec.pubno in need and rec.pubno not in out:
                 out[rec.pubno] = rec
+
+    for rec in global_docs:
+        if rec.pubno in need and rec.pubno not in out:
+            out[rec.pubno] = rec
 
     missing = [p for p in need if p not in out]
     if missing:
@@ -747,7 +883,9 @@ def evaluate_model(
             cand_list = []
             cand_list.extend(q.positive_pubnos)
             cand_list.extend(q.bm25_hard_neg_pubnos)
+            cand_list.extend(q.ipc_semantic_neg_pubnos)
             cand_list.extend(q.ipc_random_neg_pubnos)
+            cand_list.extend(q.cross_ipc_hard_neg_pubnos)
 
             # Dedup preserving order.
             seen: Set[str] = set()
@@ -819,9 +957,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--hard-neg-per-query", type=int, default=10)
+    p.add_argument("--ipc-semantic-per-query", type=int, default=0)
     p.add_argument("--ipc-random-per-query", type=int, default=10)
+    p.add_argument("--cross-ipc-hard-per-query", type=int, default=0)
     p.add_argument("--bm25-top-k", type=int, default=200)
+    p.add_argument("--cross-ipc-bm25-top-k", type=int, default=600)
     p.add_argument("--bm25-pool-per-ipc", type=int, default=5000)
+    p.add_argument("--global-bm25-pool-size", type=int, default=0)
 
     p.add_argument("--exclude-pubno-file", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
@@ -841,6 +983,12 @@ def main() -> int:
 
     if args.window_years <= 0:
         raise ValueError("window_years must be > 0")
+    if args.hard_neg_per_query < 0 or args.ipc_semantic_per_query < 0 or args.ipc_random_per_query < 0:
+        raise ValueError("negative counts must be >= 0")
+    if args.cross_ipc_hard_per_query < 0:
+        raise ValueError("cross_ipc_hard_per_query must be >= 0")
+    if args.cross_ipc_hard_per_query > 0 and args.global_bm25_pool_size <= 0:
+        raise ValueError("global_bm25_pool_size must be > 0 when cross_ipc_hard_per_query > 0")
 
     start_year = args.query_year - args.window_years
     end_year = args.query_year - 1
@@ -854,7 +1002,9 @@ def main() -> int:
     excluded = load_excluded_pubnos(args.exclude_pubno_file)
     log(
         f"Output={run_dir}, query_year={args.query_year}, window=[{start_year},{end_year}], query_size={args.query_size}, "
-        f"hard_neg_per_query={args.hard_neg_per_query}, ipc_random_per_query={args.ipc_random_per_query}, excluded={len(excluded)}"
+        f"hard_neg_per_query={args.hard_neg_per_query}, ipc_semantic_per_query={args.ipc_semantic_per_query}, "
+        f"ipc_random_per_query={args.ipc_random_per_query}, cross_ipc_hard_per_query={args.cross_ipc_hard_per_query}, "
+        f"excluded={len(excluded)}"
     )
 
     conn = sqlite3.connect(args.db_path)
@@ -897,7 +1047,7 @@ def main() -> int:
             if q.query_ipc4:
                 ipc_set.add(q.query_ipc4)
 
-        positive_map, ipc_reservoir = scan_window_collect(
+        positive_map, ipc_reservoir, global_reservoir = scan_window_collect(
             conn=conn,
             table=args.table,
             start_year=start_year,
@@ -906,6 +1056,7 @@ def main() -> int:
             target_ipc_set=ipc_set,
             excluded_pubnos=excluded,
             bm25_pool_per_ipc=args.bm25_pool_per_ipc,
+            global_bm25_pool_size=args.global_bm25_pool_size,
             rng=rng,
             sql_fetch_batch=args.sql_fetch_batch,
         )
@@ -914,14 +1065,18 @@ def main() -> int:
             query_raw_pool=query_raw_pool,
             positive_map=positive_map,
             ipc_reservoir=ipc_reservoir,
+            global_docs=global_reservoir,
             query_size=args.query_size,
             hard_neg_per_query=args.hard_neg_per_query,
+            ipc_semantic_per_query=args.ipc_semantic_per_query,
             ipc_random_per_query=args.ipc_random_per_query,
+            cross_ipc_hard_per_query=args.cross_ipc_hard_per_query,
             bm25_top_k=args.bm25_top_k,
+            cross_ipc_bm25_top_k=args.cross_ipc_bm25_top_k,
             rng=rng,
         )
 
-        candidate_map = build_global_candidate_map(final_queries, positive_map, ipc_reservoir)
+        candidate_map = build_global_candidate_map(final_queries, positive_map, ipc_reservoir, global_reservoir)
         t1 = time.time()
 
     finally:
@@ -951,15 +1106,25 @@ def main() -> int:
         "query_source_citation_csv": args.query_source_citation_csv,
         "query_size": len(final_queries),
         "hard_neg_per_query": args.hard_neg_per_query,
+        "ipc_semantic_per_query": args.ipc_semantic_per_query,
         "ipc_random_per_query": args.ipc_random_per_query,
+        "cross_ipc_hard_per_query": args.cross_ipc_hard_per_query,
         "bm25_top_k": args.bm25_top_k,
+        "cross_ipc_bm25_top_k": args.cross_ipc_bm25_top_k,
         "bm25_pool_per_ipc": args.bm25_pool_per_ipc,
+        "global_bm25_pool_size": args.global_bm25_pool_size,
         "exclude_pubno_file": args.exclude_pubno_file,
         "exclude_pubno_count": len(excluded),
         "positive_counts": {
             "total_from_self": self_pos_total,
             "total_from_other": other_pos_total,
             "avg_positive_per_query": float(np.mean([len(q.positive_pubnos) for q in final_queries])),
+        },
+        "negative_counts": {
+            "avg_bm25_hard_per_query": float(np.mean([len(q.bm25_hard_neg_pubnos) for q in final_queries])),
+            "avg_ipc_semantic_per_query": float(np.mean([len(q.ipc_semantic_neg_pubnos) for q in final_queries])),
+            "avg_ipc_random_per_query": float(np.mean([len(q.ipc_random_neg_pubnos) for q in final_queries])),
+            "avg_cross_ipc_hard_per_query": float(np.mean([len(q.cross_ipc_hard_neg_pubnos) for q in final_queries])),
         },
         "global_candidate_universe_size": len(candidate_map),
         "build_time_seconds": float(t1 - t0),

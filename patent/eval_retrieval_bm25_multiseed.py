@@ -60,9 +60,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--query-source-citation-csv", type=str, default="")
 
     p.add_argument("--hard-neg-per-query", type=int, default=10)
+    p.add_argument("--ipc-semantic-per-query", type=int, default=0)
     p.add_argument("--ipc-random-per-query", type=int, default=10)
+    p.add_argument("--cross-ipc-hard-per-query", type=int, default=0)
     p.add_argument("--bm25-top-k", type=int, default=200)
+    p.add_argument("--cross-ipc-bm25-top-k", type=int, default=600)
     p.add_argument("--bm25-pool-per-ipc", type=int, default=5000)
+    p.add_argument("--global-bm25-pool-size", type=int, default=0)
 
     p.add_argument("--exclude-pubno-file", type=str, default="")
 
@@ -120,12 +124,20 @@ def main() -> int:
             str(args.max_query_scan),
             "--hard-neg-per-query",
             str(args.hard_neg_per_query),
+            "--ipc-semantic-per-query",
+            str(args.ipc_semantic_per_query),
             "--ipc-random-per-query",
             str(args.ipc_random_per_query),
+            "--cross-ipc-hard-per-query",
+            str(args.cross_ipc_hard_per_query),
             "--bm25-top-k",
             str(args.bm25_top_k),
+            "--cross-ipc-bm25-top-k",
+            str(args.cross_ipc_bm25_top_k),
             "--bm25-pool-per-ipc",
             str(args.bm25_pool_per_ipc),
+            "--global-bm25-pool-size",
+            str(args.global_bm25_pool_size),
             "--device",
             args.device,
             "--batch-size",
