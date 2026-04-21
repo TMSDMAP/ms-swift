@@ -226,6 +226,32 @@ class HFEmbedder:
         log(f"Model ready on device: {self.device}")
 
     @torch.inference_mode()
+    def encode_batch(self, batch: Sequence[str]) -> np.ndarray:
+        if not batch:
+            return np.zeros((0, 1), dtype=np.float32)
+
+        tokens = self.tokenizer(
+            list(batch),
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        tokens = {k: v.to(self.device) for k, v in tokens.items()}
+        outputs = self.model(**tokens, return_dict=True)
+
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            emb = outputs.pooler_output
+        else:
+            hidden = outputs.last_hidden_state
+            mask = tokens["attention_mask"].unsqueeze(-1)
+            denom = torch.clamp(mask.sum(dim=1), min=1)
+            emb = (hidden * mask).sum(dim=1) / denom
+
+        emb = torch.nn.functional.normalize(emb.float(), p=2, dim=1)
+        return emb.cpu().numpy().astype(np.float32)
+
+    @torch.inference_mode()
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         if not texts:
             return np.zeros((0, 1), dtype=np.float32)
@@ -238,26 +264,7 @@ class HFEmbedder:
 
         for batch_idx, start in enumerate(range(0, len(texts), self.batch_size), start=1):
             batch = texts[start : start + self.batch_size]
-            tokens = self.tokenizer(
-                list(batch),
-                padding=True,
-                truncation=True,
-                max_length=self.max_length,
-                return_tensors="pt",
-            )
-            tokens = {k: v.to(self.device) for k, v in tokens.items()}
-            outputs = self.model(**tokens, return_dict=True)
-
-            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-                emb = outputs.pooler_output
-            else:
-                hidden = outputs.last_hidden_state
-                mask = tokens["attention_mask"].unsqueeze(-1)
-                denom = torch.clamp(mask.sum(dim=1), min=1)
-                emb = (hidden * mask).sum(dim=1) / denom
-
-            emb = torch.nn.functional.normalize(emb.float(), p=2, dim=1)
-            out.append(emb.cpu().numpy().astype(np.float32))
+            out.append(self.encode_batch(batch))
 
             if batch_idx == next_report_at or batch_idx == total_batches:
                 pct = 100.0 * batch_idx / max(1, total_batches)
@@ -265,6 +272,120 @@ class HFEmbedder:
                 next_report_at = batch_idx + report_step
 
         return np.concatenate(out, axis=0)
+
+
+def encode_with_resume_cache(
+    embedder: HFEmbedder,
+    texts: Sequence[str],
+    cache_dir: Optional[Path],
+    cache_key: str,
+) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, 1), dtype=np.float32)
+    if cache_dir is None:
+        return embedder.encode(texts)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = cache_dir / f"{cache_key}.meta.json"
+    data_path = cache_dir / f"{cache_key}.f32memmap"
+
+    total_texts = len(texts)
+    batch_size = max(1, embedder.batch_size)
+    total_batches = (total_texts + batch_size - 1) // batch_size
+
+    start_batch = 0
+    emb_dim = 0
+    meta_ok = False
+
+    if meta_path.exists() and data_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta_ok = (
+                int(meta.get("text_count", -1)) == total_texts
+                and int(meta.get("batch_size", -1)) == batch_size
+                and int(meta.get("max_length", -1)) == int(embedder.max_length)
+            )
+            if meta_ok:
+                start_batch = int(meta.get("completed_batches", 0))
+                start_batch = max(0, min(start_batch, total_batches))
+                emb_dim = int(meta.get("embedding_dim", 0))
+        except Exception:
+            meta_ok = False
+
+    if not meta_ok:
+        start_batch = 0
+        emb_dim = 0
+        if meta_path.exists():
+            meta_path.unlink(missing_ok=True)
+        if data_path.exists():
+            data_path.unlink(missing_ok=True)
+
+    mem: Optional[np.memmap] = None
+    if emb_dim > 0 and data_path.exists():
+        try:
+            mode = "r" if start_batch >= total_batches else "r+"
+            mem = np.memmap(data_path, dtype=np.float32, mode=mode, shape=(total_texts, emb_dim))
+        except Exception:
+            start_batch = 0
+            emb_dim = 0
+            mem = None
+            if meta_path.exists():
+                meta_path.unlink(missing_ok=True)
+            if data_path.exists():
+                data_path.unlink(missing_ok=True)
+
+    if start_batch >= total_batches and mem is not None:
+        log(
+            f"Resume mode: loading cached {cache_key} embeddings from {data_path} "
+            f"(texts={total_texts}, batches={total_batches})"
+        )
+        return np.asarray(mem)
+
+    log(f"Encoding {total_texts} texts (batch_size={batch_size}, max_length={embedder.max_length})")
+    if start_batch > 0:
+        log(f"Resume mode: continuing {cache_key} encoding from batch {start_batch + 1}/{total_batches}")
+
+    report_step = max(1, total_batches // 50)
+    next_report_at = start_batch + 1
+
+    for batch_no in range(start_batch + 1, total_batches + 1):
+        start = (batch_no - 1) * batch_size
+        batch = texts[start : start + batch_size]
+        emb = embedder.encode_batch(batch)
+
+        if emb_dim <= 0:
+            emb_dim = int(emb.shape[1])
+            mem = np.memmap(data_path, dtype=np.float32, mode="w+", shape=(total_texts, emb_dim))
+        elif emb.shape[1] != emb_dim:
+            raise RuntimeError(
+                f"embedding dim changed during {cache_key} encoding: {emb.shape[1]} vs {emb_dim}"
+            )
+        elif mem is None:
+            mem = np.memmap(data_path, dtype=np.float32, mode="r+", shape=(total_texts, emb_dim))
+
+        mem[start : start + len(batch)] = emb
+        mem.flush()
+
+        meta_obj = {
+            "cache_key": cache_key,
+            "text_count": total_texts,
+            "batch_size": batch_size,
+            "max_length": int(embedder.max_length),
+            "embedding_dim": emb_dim,
+            "completed_batches": batch_no,
+            "total_batches": total_batches,
+            "complete": bool(batch_no >= total_batches),
+            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        meta_path.write_text(json.dumps(meta_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if batch_no >= next_report_at or batch_no == total_batches:
+            pct = 100.0 * batch_no / max(1, total_batches)
+            log(f"Encoding progress: {batch_no}/{total_batches} batches ({pct:.1f}%)")
+            next_report_at = batch_no + report_step
+
+    assert mem is not None
+    return np.asarray(mem)
 
 
 def valid_text_filter_sql() -> str:
@@ -640,6 +761,8 @@ def build_final_queries(
     bm25_top_k: int,
     cross_ipc_bm25_top_k: int,
     rng: random.Random,
+    allow_partial_final_queries: bool,
+    min_final_queries: int,
 ) -> List[QueryFinal]:
     # Build BM25 index for each IPC pool once.
     ipc_bm25_state: Dict[str, Dict[str, object]] = {}
@@ -857,9 +980,23 @@ def build_final_queries(
         final.append(qf)
 
     if len(final) < query_size:
-        raise RuntimeError(
-            f"Not enough finalized queries: need {query_size}, got {len(final)}. "
-            "Increase query_pool_multiplier/max_query_scan or reduce negative counts."
+        if not allow_partial_final_queries:
+            raise RuntimeError(
+                f"Not enough finalized queries: need {query_size}, got {len(final)}. "
+                "Increase query_pool_multiplier/max_query_scan or reduce negative counts."
+            )
+
+        min_need = max(1, int(min_final_queries)) if min_final_queries > 0 else 1
+        if len(final) < min_need:
+            raise RuntimeError(
+                f"Not enough finalized queries even with partial mode: "
+                f"target={query_size}, got={len(final)}, min_required={min_need}. "
+                "Increase window/query pool or reduce negative constraints."
+            )
+
+        log(
+            "WARNING: finalized queries below target but partial mode enabled: "
+            f"target={query_size}, got={len(final)}, min_required={min_need}."
         )
 
     return final
@@ -907,6 +1044,7 @@ def calc_single_query_metrics(
     k_list: Sequence[int],
 ) -> Dict[str, float]:
     rel = np.asarray([1 if p in positive_set else 0 for p in ranked_pubnos], dtype=np.int32)
+    discounts = 1.0 / np.log2(np.arange(2, len(rel) + 2)) if len(rel) > 0 else np.asarray([], dtype=np.float64)
     pos_idx = np.where(rel == 1)[0]
     if pos_idx.size == 0:
         # Should not happen; keep safe default.
@@ -922,7 +1060,6 @@ def calc_single_query_metrics(
         precision_at_rel = cumsum[pos_idx] / (pos_idx + 1)
         ap = float(np.mean(precision_at_rel))
 
-        discounts = 1.0 / np.log2(np.arange(2, len(rel) + 2))
         dcg = float(np.sum(rel * discounts))
         ideal_rel = np.zeros_like(rel)
         ideal_rel[: len(pos_idx)] = 1
@@ -941,6 +1078,17 @@ def calc_single_query_metrics(
         top_rel = int(np.sum(rel[:k]))
         out[f"hit@{k}"] = 1.0 if top_rel > 0 else 0.0
         out[f"recall@{k}"] = float(top_rel / pos_count)
+
+        if len(rel) == 0 or pos_idx.size == 0:
+            out[f"ndcg@{k}"] = 0.0
+            continue
+
+        k_eff = min(k, len(rel))
+        dcg_k = float(np.sum(rel[:k_eff] * discounts[:k_eff]))
+        ideal_rel_k = np.zeros(k_eff, dtype=np.int32)
+        ideal_rel_k[: min(len(pos_idx), k_eff)] = 1
+        idcg_k = float(np.sum(ideal_rel_k * discounts[:k_eff]))
+        out[f"ndcg@{k}"] = float(dcg_k / idcg_k) if idcg_k > 0 else 0.0
 
     return out
 
@@ -963,6 +1111,7 @@ def aggregate_metrics(per_query_metrics: Sequence[Dict[str, float]], k_list: Seq
     for k in k_list:
         out[f"hit@{k}"] = mean_key(f"hit@{k}")
         out[f"recall@{k}"] = mean_key(f"recall@{k}")
+        out[f"ndcg@{k}"] = mean_key(f"ndcg@{k}")
 
     return out
 
@@ -983,6 +1132,7 @@ def evaluate_model(
     candidate_map: Dict[str, PatentText],
     rank_chunk_size: int,
     k_list: Sequence[int],
+    embed_cache_dir: Optional[Path] = None,
 ) -> Dict[str, object]:
     # Encode global candidate universe once.
     candidate_pubnos = sorted(candidate_map.keys())
@@ -990,11 +1140,11 @@ def evaluate_model(
     cand_index = {p: i for i, p in enumerate(candidate_pubnos)}
 
     t0 = time.time()
-    cand_emb = embedder.encode(cand_texts)
+    cand_emb = encode_with_resume_cache(embedder, cand_texts, embed_cache_dir, "candidate")
     t1 = time.time()
 
     query_texts = [q.as_input_text() for q in final_queries]
-    query_emb = embedder.encode(query_texts)
+    query_emb = encode_with_resume_cache(embedder, query_texts, embed_cache_dir, "query")
     t2 = time.time()
 
     device = embedder.device
@@ -1110,11 +1260,20 @@ def validate_resume_dataset_meta(
 ) -> None:
     mismatches: List[str] = []
 
+    meta_query_size_target = dataset_meta.get("query_size_target")
+    if meta_query_size_target is None and not args.allow_partial_final_queries:
+        meta_query_size_target = dataset_meta.get("query_size")
+    if meta_query_size_target is not None and meta_query_size_target != args.query_size:
+        mismatches.append(
+            f"query_size_target: meta={meta_query_size_target!r}, args={args.query_size!r}"
+        )
+
     scalar_checks = {
         "query_year": args.query_year,
         "query_source_citation_csv": args.query_source_citation_csv,
         "xy_citation_only": args.xy_citation_only,
-        "query_size": args.query_size,
+        "allow_partial_final_queries": args.allow_partial_final_queries,
+        "min_final_queries": args.min_final_queries,
         "hard_neg_per_query": args.hard_neg_per_query,
         "ipc_semantic_per_query": args.ipc_semantic_per_query,
         "ipc_random_per_query": args.ipc_random_per_query,
@@ -1166,6 +1325,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--query-year", type=int, default=2020)
     p.add_argument("--window-years", type=int, default=3)
     p.add_argument("--query-size", type=int, default=2000)
+    p.add_argument(
+        "--allow-partial-final-queries",
+        action="store_true",
+        help="Allow evaluation to proceed with fewer finalized queries than --query-size.",
+    )
+    p.add_argument(
+        "--min-final-queries",
+        type=int,
+        default=0,
+        help="Minimum finalized queries required when --allow-partial-final-queries is set; 0 means no explicit floor.",
+    )
     p.add_argument("--query-pool-multiplier", type=int, default=25)
     p.add_argument("--max-query-scan", type=int, default=300000)
     p.add_argument(
@@ -1243,6 +1413,12 @@ def main() -> int:
         raise ValueError("cross_ipc_hard_per_query must be >= 0")
     if args.cross_ipc_hard_per_query > 0 and args.global_bm25_pool_size <= 0:
         raise ValueError("global_bm25_pool_size must be > 0 when cross_ipc_hard_per_query > 0")
+    if args.min_final_queries < 0:
+        raise ValueError("min_final_queries must be >= 0")
+    if args.min_final_queries > 0 and not args.allow_partial_final_queries:
+        raise ValueError("min_final_queries requires --allow-partial-final-queries")
+    if args.min_final_queries > args.query_size:
+        raise ValueError("min_final_queries cannot exceed query_size")
 
     start_year = args.query_year - args.window_years
     end_year = args.query_year - 1
@@ -1279,10 +1455,18 @@ def main() -> int:
 
         final_queries = load_queries_jsonl(q_path)
         candidate_map = load_candidate_map_jsonl(c_path)
-        if len(final_queries) != args.query_size:
-            raise ValueError(
-                f"resume dataset query size mismatch: args={args.query_size}, existing={len(final_queries)}"
-            )
+        if args.allow_partial_final_queries:
+            min_need = max(1, int(args.min_final_queries)) if args.min_final_queries > 0 else 1
+            if len(final_queries) < min_need:
+                raise ValueError(
+                    "resume dataset query size too small for partial mode: "
+                    f"min_required={min_need}, existing={len(final_queries)}"
+                )
+        else:
+            if len(final_queries) != args.query_size:
+                raise ValueError(
+                    f"resume dataset query size mismatch: args={args.query_size}, existing={len(final_queries)}"
+                )
 
         if dataset_meta_path.exists():
             dataset_meta = read_json(dataset_meta_path)
@@ -1299,7 +1483,10 @@ def main() -> int:
                 "xy_categories": sorted(xy_allowed_categories),
                 "citation_pubno_field": args.citation_pubno_field if args.xy_citation_only else "",
                 "citation_category_field": args.citation_category_field if args.xy_citation_only else "",
+                "query_size_target": args.query_size,
                 "query_size": len(final_queries),
+                "allow_partial_final_queries": args.allow_partial_final_queries,
+                "min_final_queries": args.min_final_queries,
                 "hard_neg_per_query": args.hard_neg_per_query,
                 "ipc_semantic_per_query": args.ipc_semantic_per_query,
                 "ipc_random_per_query": args.ipc_random_per_query,
@@ -1329,7 +1516,10 @@ def main() -> int:
                 },
             }
 
+        dataset_meta["query_size_target"] = args.query_size
         dataset_meta["query_size"] = len(final_queries)
+        dataset_meta["allow_partial_final_queries"] = args.allow_partial_final_queries
+        dataset_meta["min_final_queries"] = args.min_final_queries
         dataset_meta["global_candidate_universe_size"] = len(candidate_map)
         dataset_meta.setdefault("build_time_seconds", 0.0)
         dataset_meta.setdefault("artifacts", {})
@@ -1412,6 +1602,8 @@ def main() -> int:
                 bm25_top_k=args.bm25_top_k,
                 cross_ipc_bm25_top_k=args.cross_ipc_bm25_top_k,
                 rng=rng,
+                allow_partial_final_queries=args.allow_partial_final_queries,
+                min_final_queries=args.min_final_queries,
             )
 
             candidate_map = build_global_candidate_map(final_queries, positive_map, ipc_reservoir, global_reservoir)
@@ -1442,7 +1634,10 @@ def main() -> int:
             "xy_categories": sorted(xy_allowed_categories),
             "citation_pubno_field": args.citation_pubno_field if args.xy_citation_only else "",
             "citation_category_field": args.citation_category_field if args.xy_citation_only else "",
+            "query_size_target": args.query_size,
             "query_size": len(final_queries),
+            "allow_partial_final_queries": args.allow_partial_final_queries,
+            "min_final_queries": args.min_final_queries,
             "hard_neg_per_query": args.hard_neg_per_query,
             "ipc_semantic_per_query": args.ipc_semantic_per_query,
             "ipc_random_per_query": args.ipc_random_per_query,
@@ -1482,7 +1677,14 @@ def main() -> int:
     else:
         log("Evaluating fine-tuned model...")
         ft = HFEmbedder(args.finetuned_model_path, args.device, args.max_length, args.batch_size)
-        ft_eval = evaluate_model(ft, final_queries, candidate_map, args.rank_chunk_size, k_list)
+        ft_eval = evaluate_model(
+            ft,
+            final_queries,
+            candidate_map,
+            args.rank_chunk_size,
+            k_list,
+            embed_cache_dir=(run_dir / "eval_finetuned_embed_cache") if args.resume else None,
+        )
         write_json(ft_cache_path, ft_eval)
         del ft
         if torch.cuda.is_available():
@@ -1494,7 +1696,14 @@ def main() -> int:
     else:
         log("Evaluating base model...")
         base = HFEmbedder(args.base_model_path, args.device, args.max_length, args.batch_size)
-        base_eval = evaluate_model(base, final_queries, candidate_map, args.rank_chunk_size, k_list)
+        base_eval = evaluate_model(
+            base,
+            final_queries,
+            candidate_map,
+            args.rank_chunk_size,
+            k_list,
+            embed_cache_dir=(run_dir / "eval_base_embed_cache") if args.resume else None,
+        )
         write_json(base_cache_path, base_eval)
         del base
         if torch.cuda.is_available():
@@ -1513,7 +1722,7 @@ def main() -> int:
         f.write(
             "query_pubno,query_ipc4,positive_count,candidate_count,"
             "rank_finetuned,rank_base,rr_finetuned,rr_base,ap_finetuned,ap_base,"
-            "ndcg_finetuned,ndcg_base,top1_pubno_finetuned,top1_pubno_base\n"
+            "ndcg_finetuned,ndcg_base,ndcg@5_finetuned,ndcg@5_base,top1_pubno_finetuned,top1_pubno_base\n"
         )
         for i, q in enumerate(final_queries):
             a = ft_eval["per_query"][i]
@@ -1522,7 +1731,8 @@ def main() -> int:
                 f"{q.query_pubno},{q.query_ipc4},{int(a['positive_count'])},{int(a['candidate_count'])},"
                 f"{a['first_rel_rank']:.0f},{b['first_rel_rank']:.0f},"
                 f"{a['rr']:.8f},{b['rr']:.8f},{a['ap']:.8f},{b['ap']:.8f},"
-                f"{a['ndcg']:.8f},{b['ndcg']:.8f},{a['top1_pubno']},{b['top1_pubno']}\n"
+                f"{a['ndcg']:.8f},{b['ndcg']:.8f},{float(a.get('ndcg@5', float('nan'))):.8f},{float(b.get('ndcg@5', float('nan'))):.8f},"
+                f"{a['top1_pubno']},{b['top1_pubno']}\n"
             )
 
     summary = {
@@ -1573,6 +1783,9 @@ def main() -> int:
         for k in [1, 3, 5, 10, 20, 50]:
             metric_keys.append(f"hit@{k}")
             metric_keys.append(f"recall@{k}")
+            ndcgk = f"ndcg@{k}"
+            if ndcgk in ft_eval["metrics"] and ndcgk in base_eval["metrics"]:
+                metric_keys.append(ndcgk)
         for k in metric_keys:
             f.write(f"{k},{float(ft_eval['metrics'][k]):.8f},{float(base_eval['metrics'][k]):.8f}\n")
 
